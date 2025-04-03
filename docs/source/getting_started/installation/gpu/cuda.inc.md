@@ -167,6 +167,24 @@ cd vllm
 VLLM_CUTLASS_SRC_DIR=/path/to/cutlass pip install -e .
 ```
 
+##### Use the conda installed CUDA for compilation
+
+If you do not have a full installation of CUDA Toolkit, or you don't have root access to the machine while the pre-installed CUDA version doesn't suit the need, you can use the conda installed CUDA for compilation.
+
+```console
+conda create -n vllm-build python=3.12 -y
+conda activate vllm-build
+export USE_CUDA_VERSION=12.4
+conda install -y cuda=$USE_CUDA_VERSION cuda-version=$USE_CUDA_VERSION libcublas=$USE_CUDA_VERSION nccl gcc gxx cudnn nvtx cutensor cusparselt cuda-nvtx-dev=$USE_CUDA_VERSION cmake ninja -c conda-forge
+export CUDA_HOME=$CONDA_PREFIX
+export CUDA_ROOT=$(find "$CONDA_PREFIX" -wholename "*/include/cuda_runtime.h" -exec dirname {} \;)
+
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+pip install -r requirements/build.txt
+pip install -e . --no-build-isolation
+```
+
 ##### Troubleshooting
 
 To avoid your system being overloaded, you can limit the number of compilation jobs

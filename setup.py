@@ -204,6 +204,15 @@ class cmake_build_ext(build_ext):
         # Make sure we use the nvcc from CUDA_HOME
         if _is_cuda():
             cmake_args += [f'-DCMAKE_CUDA_COMPILER={CUDA_HOME}/bin/nvcc']
+            # Follow TensorRT convention to use CUDA_ROOT
+            # https://github.com/NVIDIA/TensorRT/blob/8c6d69ddec0b2feff12f55472dc5d55cb6861d53/python/build.sh#L22
+            CUDA_ROOT = os.environ.get("CUDA_ROOT", None)
+            if CUDA_ROOT is not None:
+                cmake_args += [
+                    '-DCUDA_TOOLKIT_ROOT_DIR={}'.format(CUDA_ROOT),
+                    '-DCUDA_INCLUDE_DIRS={}/include'.format(CUDA_ROOT),
+                ]
+
         subprocess.check_call(
             ['cmake', ext.cmake_lists_dir, *build_tool, *cmake_args],
             cwd=self.build_temp)
