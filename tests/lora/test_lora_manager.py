@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,6 +13,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.config.lora import LoRAConfig
 from vllm.lora.layers import (
     ColumnParallelLinearWithLoRA,
+    MergedColumnParallelLinearVariableSliceWithLoRA,
     MergedColumnParallelLinearWithLoRA,
     RowParallelLinearWithLoRA,
 )
@@ -26,6 +28,7 @@ from vllm.lora.model_manager import (
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager, WorkerLoRAManager
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.platforms import current_platform
 
 from .utils import create_peft_lora
@@ -43,6 +46,106 @@ DEVICES = (
 )
 
 DEFAULT_DTYPE = torch.get_default_dtype()
+
+
+def test_dummy_packed_output_dims_prefers_explicit_group_lengths():
+    manager = object.__new__(LoRAModelManager)
+    output_sizes = [2, 3, 5, 7, 11]
+    module = SimpleNamespace(
+        base_layer=SimpleNamespace(
+            output_sizes=output_sizes,
+            packed_lora_group_lengths=[1, 4],
+        ),
+        lora_b_stacked=tuple(
+            torch.empty(1, 1, output_size, 8) for output_size in output_sizes
+        ),
+    )
+
+    output_dims = manager._get_dummy_packed_output_dims("abcde", module, ["ab", "cde"])
+
+    assert output_dims == [2, 26]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_dummy_packed_lora_warmup_variable_slice_activation(
+    default_vllm_config, dist_init, device
+):
+    if current_platform.is_cuda_alike():
+        torch.accelerator.set_device_index(device)
+
+    class PackedDummyLoRAModel(nn.Sequential):
+        supports_lora = True
+
+    rank = 8
+    output_sizes = [2, 3, 5, 7]
+    layer = MergedColumnParallelLinear(
+        16, output_sizes, bias=False, params_dtype=DEFAULT_DTYPE
+    ).to(device)
+    layer.packed_lora_group_lengths = [1, 3]
+
+    model = PackedDummyLoRAModel()
+    model.add_module("packed_proj", layer)
+    model.config = SimpleNamespace()
+    model.embedding_modules = {}
+    model.packed_modules_mapping = {
+        "packed_proj": ["ab", "cde"],
+    }
+
+    manager = LoRAModelManager(
+        model,
+        1,
+        1,
+        1,
+        LoRAConfig(
+            max_lora_rank=rank,
+            max_cpu_loras=1,
+            max_loras=1,
+            lora_dtype=DEFAULT_DTYPE,
+        ),
+        device=device,
+    )
+
+    lora_module = manager.model.get_submodule("packed_proj")
+    assert isinstance(lora_module, MergedColumnParallelLinearVariableSliceWithLoRA)
+
+    dummy_lora = manager.create_dummy_lora(1, rank, model.embedding_modules)
+    packed_lora = dummy_lora.get_lora("packed_proj")
+    assert packed_lora and isinstance(packed_lora, PackedLoRALayerWeights)
+    assert len(packed_lora.lora_a) == len(packed_lora.lora_b) == 2
+    assert len(packed_lora.lora_b) != lora_module.n_slices
+    assert [tuple(t.shape) for t in packed_lora.lora_b] == [(2, rank), (15, rank)]
+
+    assert packed_lora.lora_a[0] is not None
+    assert packed_lora.lora_a[1] is not None
+    packed_lora.lora_a[0].fill_(1)
+    packed_lora.lora_a[1].fill_(2)
+    packed_lora.lora_b[0].copy_(torch.full_like(packed_lora.lora_b[0], 10))
+    grouped_b = [
+        torch.full(
+            (output_size, rank),
+            fill_value,
+            dtype=packed_lora.lora_b[1].dtype,
+            device=packed_lora.lora_b[1].device,
+        )
+        for output_size, fill_value in zip(output_sizes[1:], [20, 30, 40])
+    ]
+    packed_lora.lora_b[1].copy_(torch.cat(grouped_b, dim=0))
+
+    assert manager.add_adapter(dummy_lora)
+    assert manager.activate_adapter(1)
+    assert manager.lora_index_to_id[0] == 1
+
+    expected_lora_a = [
+        packed_lora.lora_a[0],
+        packed_lora.lora_a[1],
+        packed_lora.lora_a[1],
+        packed_lora.lora_a[1],
+    ]
+    expected_lora_b = [packed_lora.lora_b[0], *grouped_b]
+    for i, expected in enumerate(expected_lora_a):
+        torch.testing.assert_close(lora_module.lora_a_stacked[i][0, 0], expected)
+    for i, expected in enumerate(expected_lora_b):
+        torch.testing.assert_close(lora_module.lora_b_stacked[i][0, 0], expected)
 
 
 @pytest.mark.parametrize("device", DEVICES)

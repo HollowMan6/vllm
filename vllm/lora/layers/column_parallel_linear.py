@@ -286,6 +286,10 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return (
             type(source_layer) is MergedColumnParallelLinear
             and len(packed_modules_list) == 2
+            and not (
+                hasattr(source_layer, "output_sizes")
+                and len(source_layer.output_sizes) >= 3
+            )
         )
 
 
@@ -604,28 +608,92 @@ class MergedColumnParallelLinearVariableSliceWithLoRA(
         packed_modules_list: list,
         model_config: PretrainedConfig | None = None,
     ) -> bool:
-        # Support MergedColumnParallelLinear with 3 or more slices
-        # (2 slices are handled by MergedColumnParallelLinearWithLoRA)
         if type(source_layer) is not MergedColumnParallelLinear:
             return False
 
-        # If packed_modules_list has 3+ items, use this class
+        # Prefer the variable-slice implementation whenever the underlying
+        # merged layer exposes 3+ internal slices, even if the checkpoint only
+        # stores a smaller number of packed logical LoRA modules.
+        if (
+            hasattr(source_layer, "output_sizes")
+            and len(source_layer.output_sizes) >= 3
+        ):
+            return True
+
         if len(packed_modules_list) >= 3:
             return True
 
-        # If packed_modules_list has exactly 2 items, let
-        # MergedColumnParallelLinearWithLoRA handle it
         if len(packed_modules_list) == 2:
             return False
 
-        # If packed_modules_list is empty or has 1 item,
-        # check the layer's output_sizes.
-        # This handles cases where the checkpoint has a single weight
-        # but the layer has multiple slices (3+)
-        return (
-            hasattr(source_layer, "output_sizes")
-            and len(source_layer.output_sizes) >= 3
-        )
+        return False
+
+    @staticmethod
+    def _infer_group_lengths(
+        lora_b: list[torch.Tensor | None],
+        output_sizes: list[int] | tuple[int, ...],
+    ) -> list[int] | None:
+        num_groups = len(lora_b)
+        num_slices = len(output_sizes)
+
+        def _search(slice_idx: int, group_idx: int) -> list[int] | None:
+            if group_idx == num_groups:
+                return [] if slice_idx == num_slices else None
+
+            remaining_groups = num_groups - group_idx
+            max_group_len = num_slices - slice_idx - (remaining_groups - 1)
+            if max_group_len < 1:
+                return None
+
+            for group_len in range(1, max_group_len + 1):
+                group_sizes = output_sizes[slice_idx : slice_idx + group_len]
+                lora_b_i = lora_b[group_idx]
+                if lora_b_i is not None and sum(group_sizes) != lora_b_i.shape[0]:
+                    continue
+
+                rest = _search(slice_idx + group_len, group_idx + 1)
+                if rest is not None:
+                    return [group_len, *rest]
+
+            return None
+
+        return _search(0, 0)
+
+    @classmethod
+    def _expand_grouped_lora_lists(
+        cls,
+        lora_a: list[torch.Tensor | None],
+        lora_b: list[torch.Tensor | None],
+        output_sizes: list[int] | tuple[int, ...],
+    ) -> tuple[list[torch.Tensor | None], list[torch.Tensor | None]]:
+        group_lengths = cls._infer_group_lengths(lora_b, output_sizes)
+        if group_lengths is None:
+            lora_b_shapes = [None if t is None else tuple(t.shape) for t in lora_b]
+            raise ValueError(
+                "Unable to expand packed LoRA weights to match merged layer "
+                f"output slices. output_sizes={list(output_sizes)}, "
+                f"lora_b_shapes={lora_b_shapes}"
+            )
+
+        expanded_a: list[torch.Tensor | None] = []
+        expanded_b: list[torch.Tensor | None] = []
+        output_idx = 0
+        for lora_a_i, lora_b_i, group_len in zip(lora_a, lora_b, group_lengths):
+            group_sizes = output_sizes[output_idx : output_idx + group_len]
+
+            expanded_a.extend([lora_a_i] * group_len)
+            if lora_b_i is None:
+                expanded_b.extend([None] * group_len)
+            else:
+                start_idx = 0
+                for group_size in group_sizes:
+                    end_idx = start_idx + group_size
+                    expanded_b.append(lora_b_i[start_idx:end_idx, :])
+                    start_idx = end_idx
+
+            output_idx += group_len
+
+        return expanded_a, expanded_b
 
     def set_lora(
         self,
@@ -653,6 +721,13 @@ class MergedColumnParallelLinearVariableSliceWithLoRA(
                 lora_b_list.append(lora_b[start_idx:end_idx, :])
                 start_idx = end_idx
             lora_b = lora_b_list
+        elif isinstance(lora_a, list) and isinstance(lora_b, list):
+            if len(lora_b) != self.n_slices:
+                lora_a, lora_b = self._expand_grouped_lora_lists(
+                    lora_a,
+                    lora_b,
+                    self.base_layer.output_sizes,
+                )
 
         # Now call parent's set_lora which expects lists
         super().set_lora(index, lora_a, lora_b)

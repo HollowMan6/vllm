@@ -138,13 +138,15 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> MergedColumnParallelLinear:
-        return MergedColumnParallelLinear(
+        layer = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[key_dim, key_dim, value_dim, value_dim],
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
         )
+        layer.packed_lora_group_lengths = [3, 1]
+        return layer
 
     def create_ba_proj(
         self,
@@ -156,13 +158,15 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # Qwen3.5 has separate in_proj_b and in_proj_a weights in the
         # checkpoint, which are loaded into the fused in_proj_ba parameter
         # via stacked_params_mapping with shard_id 0 and 1 respectively.
-        return MergedColumnParallelLinear(
+        layer = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[num_v_heads] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
         )
+        layer.packed_lora_group_lengths = [1, 1]
+        return layer
 
     def forward(
         self,
@@ -403,9 +407,12 @@ class Qwen3_5Model(Qwen3NextModel):
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
         is_fused_expert = False
+        base_layer = (
+            "base_layer." if any(".base_layer." in name for name in params_dict) else ""
+        )
         fused_expert_params_mapping = [
-            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
-            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
+            (f"experts.{base_layer}w13_weight", "experts.gate_up_proj", 0, "w1"),
+            (f"experts.{base_layer}w2_weight", "experts.down_proj", 0, "w2"),
         ]
         num_experts = (
             self.config.num_experts if hasattr(self.config, "num_experts") else 0

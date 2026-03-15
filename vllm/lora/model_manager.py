@@ -517,12 +517,15 @@ class LoRAModelManager:
             else:
                 parts = module_name.split(".")
                 replacements = self.packed_modules_mapping[parts[-1]]
+                grouped_output_dims = self._get_dummy_packed_output_dims(
+                    parts[-1], module, replacements
+                )
                 subloras: list[LoRALayerWeights | None] = []
                 for i, r in enumerate(replacements):
                     lora = LoRALayerWeights.create_dummy_lora_weights(
                         module_name + "." + r,
                         module.lora_a_stacked[i].shape[-1],
-                        module.lora_b_stacked[i].shape[-2],
+                        grouped_output_dims[i],
                         rank,
                         module.lora_a_stacked[i].dtype,
                         "cpu",
@@ -540,6 +543,83 @@ class LoRAModelManager:
                     lora = PackedLoRALayerWeights.pack(subloras)
                 model.loras[module_name] = lora
         return model
+
+    @staticmethod
+    def _infer_dummy_packed_group_lengths(
+        packed_module_name: str,
+        replacements: list[str],
+        output_sizes: list[int] | tuple[int, ...],
+    ) -> list[int] | None:
+        if len(output_sizes) == len(replacements):
+            return [1] * len(replacements)
+
+        if len(output_sizes) < len(replacements):
+            return None
+
+        common_prefix = packed_module_name
+        for replacement in replacements:
+            while common_prefix and not replacement.startswith(common_prefix):
+                common_prefix = common_prefix[:-1]
+
+        packed_suffix = packed_module_name[len(common_prefix) :]
+        replacement_suffixes = [
+            replacement[len(common_prefix) :] for replacement in replacements
+        ]
+        if (
+            packed_suffix
+            and all(replacement_suffixes)
+            and "".join(replacement_suffixes) == packed_suffix
+        ):
+            group_lengths = [len(suffix) for suffix in replacement_suffixes]
+            if sum(group_lengths) == len(output_sizes):
+                return group_lengths
+
+        return None
+
+    def _get_dummy_packed_output_dims(
+        self,
+        packed_module_name: str,
+        module: BaseLayerWithLoRA,
+        replacements: list[str],
+    ) -> list[int]:
+        output_sizes = getattr(module.base_layer, "output_sizes", None)
+        if output_sizes is None:
+            return [
+                module.lora_b_stacked[i].shape[-2] for i in range(len(replacements))
+            ]
+
+        group_lengths = getattr(module.base_layer, "packed_lora_group_lengths", None)
+        if group_lengths is not None:
+            group_lengths = list(group_lengths)
+            if (
+                len(group_lengths) != len(replacements)
+                or any(group_len < 1 for group_len in group_lengths)
+                or sum(group_lengths) != len(output_sizes)
+            ):
+                raise ValueError(
+                    "Invalid packed_lora_group_lengths for dummy packed LoRA "
+                    f"creation: packed_module_name={packed_module_name}, "
+                    f"replacements={replacements}, "
+                    f"output_sizes={list(output_sizes)}, "
+                    f"group_lengths={group_lengths}"
+                )
+        else:
+            group_lengths = self._infer_dummy_packed_group_lengths(
+                packed_module_name, replacements, output_sizes
+            )
+        if group_lengths is None:
+            return [
+                module.lora_b_stacked[i].shape[-2] for i in range(len(replacements))
+            ]
+
+        grouped_output_dims: list[int] = []
+        start_idx = 0
+        for group_len in group_lengths:
+            grouped_output_dims.append(
+                sum(output_sizes[start_idx : start_idx + group_len])
+            )
+            start_idx += group_len
+        return grouped_output_dims
 
     def _match_target_modules(self, module_name: str):
         return any(
