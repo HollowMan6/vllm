@@ -104,6 +104,12 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _is_glm_moe_dsa_config(
+    config: DeepseekV2Config | DeepseekV3Config,
+) -> bool:
+    return getattr(config, "model_type", None) == "glm_moe_dsa"
+
+
 class DeepseekAttention(nn.Module):
     """Normal MHA implementation used by Deepseek v1."""
 
@@ -631,6 +637,12 @@ class Indexer(nn.Module):
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = config.qk_rope_head_dim  # 64
         self.q_lora_rank = q_lora_rank  # 1536
+        # GLM5 follows the bf16-equivalent indexer path from HF instead of the
+        # FP8 sparse scoring path used by the DeepSeek reference.
+        self.use_bf16_scoring = _is_glm_moe_dsa_config(config)
+        # GLM5 checkpoints follow Slime's `nope|pe` ordering for the indexer
+        # head layout, while DeepSeek-V3.2 uses `pe|nope`.
+        self.indexer_pe_first = not self.use_bf16_scoring
         # no tensor parallel, just replicated
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
@@ -660,12 +672,13 @@ class Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
 
-        # NOTE: (zyongye) we use fp8 naive cache,
-        #       where we store value in fp8 and scale in fp32
-        #       per self.quant_block_size element
         self.k_cache = DeepseekV32IndexerCache(
-            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
-            dtype=torch.uint8,
+            head_dim=(
+                self.head_dim
+                if self.use_bf16_scoring
+                else self.head_dim + self.head_dim // self.quant_block_size * 4
+            ),
+            dtype=torch.bfloat16 if self.use_bf16_scoring else torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
         )
@@ -683,6 +696,7 @@ class Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            use_bf16_scoring=self.use_bf16_scoring,
         )
 
     def forward(
@@ -690,15 +704,25 @@ class Indexer(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
+        if self.indexer_pe_first:
+            q_pe, q_nope = torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+        else:
+            q_nope, q_pe = torch.split(
+                q, [self.head_dim - self.rope_dim, self.rope_dim], dim=-1
+            )
 
         k, _ = self.wk(hidden_states)
         k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
+        if self.indexer_pe_first:
+            k_pe, k_nope = torch.split(
+                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+        else:
+            k_nope, k_pe = torch.split(
+                k, [self.head_dim - self.rope_dim, self.rope_dim], dim=-1
+            )
 
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
         # Note: RoPE (NeoX) can introduce extra leading dimensions during compilation
@@ -706,11 +730,20 @@ class Indexer(nn.Module):
         q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
         k_pe = k_pe.reshape(-1, 1, self.rope_dim)
 
-        # `rotary_emb` is shape-preserving; `q_pe` is already
-        # [num_tokens, n_head, rope_dim].
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
-        k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+        if self.indexer_pe_first:
+            # `rotary_emb` is shape-preserving; `q_pe` is already
+            # [num_tokens, n_head, rope_dim].
+            q = torch.cat([q_pe, q_nope], dim=-1)
+            # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
+            k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+        else:
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            k = torch.cat([k_nope, k_pe.squeeze(-2)], dim=-1)
+
+        weights, _ = self.weights_proj(hidden_states)
+        if self.use_bf16_scoring:
+            weights = weights.float() * self.n_head**-0.5
+            return self.indexer_op(hidden_states, q.contiguous(), k, weights)
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
@@ -723,7 +756,6 @@ class Indexer(nn.Module):
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
 
-        weights, _ = self.weights_proj(hidden_states)
         weights = (
             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
         )
