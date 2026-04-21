@@ -36,25 +36,42 @@ from vllm.v1.attention.backends.linear_attn import LinearAttentionMetadata
 class MiniMaxText01RMSNormTP(CustomOp):
     name = "MiniMaxText01RMSNormTP"
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        weight_shard_count: int | None = None,
+    ) -> None:
         super().__init__()
         self.tp_world = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
-        self.weight = nn.Parameter(torch.ones(int(hidden_size / self.tp_world)))
+        self.weight_shard_count = weight_shard_count or self.tp_world
+        self.tp_weight_replicas = self.tp_world // self.weight_shard_count
+        self.weight = nn.Parameter(torch.ones(hidden_size // self.weight_shard_count))
 
         self.weight.weight_loader = self.weight_loader
         self.variance_epsilon = eps
 
-    @staticmethod
     def weight_loader(
+        self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
-        tp_world = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        loaded_weight = loaded_weight.reshape(-1)
+        param_width = param.shape[0]
+        if loaded_weight.shape[0] == param_width:
+            param.data.copy_(loaded_weight)
+            return
 
-        shard_size = loaded_weight.shape[0] // tp_world
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        if loaded_weight.shape[0] == param_width * self.tp_world:
+            shard_rank = self.tp_rank
+        else:
+            shard_rank = self.tp_rank // self.tp_weight_replicas
+
+        shard = slice(
+            shard_rank * param_width,
+            (shard_rank + 1) * param_width,
+        )
         param.data.copy_(loaded_weight[shard])
 
     def _forward(

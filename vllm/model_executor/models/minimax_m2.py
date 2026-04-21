@@ -223,7 +223,9 @@ class MiniMaxM2Attention(nn.Module):
             self.head_dim * self.total_num_heads, eps=rms_norm_eps
         )
         self.k_norm = MiniMaxText01RMSNormTP(
-            self.head_dim * self.total_num_kv_heads, eps=rms_norm_eps
+            self.head_dim * self.total_num_kv_heads,
+            eps=rms_norm_eps,
+            weight_shard_count=min(tp_size, self.total_num_kv_heads),
         )
 
     def forward(
