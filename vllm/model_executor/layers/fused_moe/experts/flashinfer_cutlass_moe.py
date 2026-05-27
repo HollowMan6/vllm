@@ -137,7 +137,8 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         return (
             p.is_cuda()
             and (
-                p.is_device_capability(90)
+                p.is_device_capability(80)
+                or p.is_device_capability(90)
                 or p.is_device_capability_family(100)
                 # SM110 excluded: flashinfer-ai/flashinfer#3134
                 or p.is_device_capability_family(120)
@@ -158,13 +159,11 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         scheme = (weight_key, activation_key)
         # The following are supported by FlashInferExperts:
         return (
-            # unquantized and fp8 static per-tensor on 9.0+
-            (
-                scheme
-                in [
-                    (None, None),
-                    (kFp8StaticTensorSym, kFp8StaticTensorSym),
-                ]
+            # unquantized on 8.0+
+            (scheme == (None, None) and p.has_device_capability(80))
+            # fp8 static per-tensor on 9.0+
+            or (
+                scheme == (kFp8StaticTensorSym, kFp8StaticTensorSym)
                 and p.has_device_capability(90)
             )
             # fp8 block-scale, wmxfp4a16 on 9.0
@@ -209,6 +208,10 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
 
     def supports_expert_map(self) -> bool:
         return False
+
+    @staticmethod
+    def supports_fused_moe_lora_params() -> bool:
+        return True
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
@@ -268,6 +271,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         workspace2: torch.Tensor | None,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
+        fused_moe_lora_params: mk.FusedMoELoraParams | None = None,
     ):
         from flashinfer.fused_moe.core import ActivationType
 
@@ -292,6 +296,10 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         )
         use_mxfp8_act_scaling = False
         use_w4_group_scaling = False
+        if fused_moe_lora_params is not None and self.quant_dtype == "nvfp4":
+            raise NotImplementedError(
+                "FlashInfer CUTLASS MoE LoRA does not support FP4 activations."
+            )
         # Select quantization metadata based on FP8 format/path
         if (
             self.quant_dtype == torch.float8_e4m3fn
@@ -378,6 +386,19 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             fc1_expert_weights = w1
             fc2_expert_weights = w2
 
+        lora_kwargs = {}
+        if fused_moe_lora_params is not None:
+            lora_kwargs = {
+                "token_lora_indices": fused_moe_lora_params.token_lora_indices,
+                "fc1_lora_ranks": fused_moe_lora_params.fc1_lora_ranks,
+                "fc1_lora_weight_ptrs": fused_moe_lora_params.fc1_lora_weight_ptrs,
+                "fc2_lora_ranks": fused_moe_lora_params.fc2_lora_ranks,
+                "fc2_lora_weight_ptrs": fused_moe_lora_params.fc2_lora_weight_ptrs,
+                "gated_lora_ranks": fused_moe_lora_params.gated_lora_ranks,
+                "gated_lora_weight_ptrs": fused_moe_lora_params.gated_lora_weight_ptrs,
+                "lora_max_rank": fused_moe_lora_params.lora_max_rank,
+            }
+
         _ = flashinfer_cutlass_fused_moe(
             input=hidden_states,
             token_selected_experts=topk_ids.to(torch.int),
@@ -403,9 +424,9 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             use_w4_group_scaling=use_w4_group_scaling,
             tune_max_num_tokens=max(self.max_capture_size, 1),
+            **lora_kwargs,
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        # No support for LoRA in flashinfer_cutlass_fused_moe.
-        # See TODOs in flashinfer functions runMoe and runMoeMinLatency.
-        raise NotImplementedError("LoRA is not supported for flashinfer_cutlass_moe")
+        # FlashInfer LoRA is handled through apply() with fused_moe_lora_params.
+        raise NotImplementedError("moe_sum is not supported for flashinfer_cutlass_moe")

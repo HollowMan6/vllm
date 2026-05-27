@@ -15,7 +15,10 @@ from vllm.model_executor.layers.fused_moe.experts.lora_context import MoELoRACon
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
 )
-from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEKernel,
+    FusedMoELoraParams,
+)
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoDPEPModular,
 )
@@ -45,6 +48,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # `create_lora_weights`) so `create_dummy_lora`'s n_slices fallback
         # matches `lora_a_stacked` length under EP.
         self.n_slices = base_layer.local_num_experts * (self._w13_slices + 1)
+        self._uses_flashinfer_lora = False
 
         self.base_layer.ensure_moe_quant_config_init()
         if getattr(self.base_layer.quant_method, "supports_internal_mk", False):
@@ -57,13 +61,45 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     prepare_finalize, self.base_layer
                 ),
             )
-        assert moe_kernel.supports_lora(), (
-            f"{type(moe_kernel.fused_experts).__name__} does not support LoRA. "
-            "For unquantized MoE, set moe_backend='triton' or moe_backend='auto' "
-            "(auto selects Triton automatically when LoRA is enabled). "
-            "For quantized MoE, mix LoRAExpertsMixin into the experts class "
-            "and consume self._lora_context in apply()."
-        )
+        fused_experts = moe_kernel.fused_experts
+        if fused_experts.supports_fused_moe_lora_params():
+            if type(self) is not FusedMoEWithLoRA:
+                raise NotImplementedError(
+                    "FlashInfer CUTLASS MoE LoRA requires split w1/w3 LoRA weights."
+                )
+            if self.base_layer.use_ep:
+                raise NotImplementedError(
+                    "FlashInfer CUTLASS MoE LoRA does not support expert "
+                    "parallelism yet."
+                )
+            if getattr(fused_experts, "quant_dtype", None) == "nvfp4":
+                raise NotImplementedError(
+                    "FlashInfer CUTLASS MoE LoRA does not support FP4 activations."
+                )
+
+            orig_apply = moe_kernel.apply
+
+            def apply_with_flashinfer_lora(*args, **kwargs):
+                hidden_states = kwargs.get("hidden_states")
+                if hidden_states is None:
+                    if not args:
+                        raise TypeError("missing hidden_states for FlashInfer MoE LoRA")
+                    hidden_states = args[0]
+                kwargs["fused_moe_lora_params"] = self._build_flashinfer_lora_params(
+                    hidden_states
+                )
+                return orig_apply(*args, **kwargs)
+
+            moe_kernel.apply = apply_with_flashinfer_lora
+            self._uses_flashinfer_lora = True
+        else:
+            assert moe_kernel.supports_lora(), (
+                f"{type(moe_kernel.fused_experts).__name__} does not support LoRA. "
+                "For unquantized MoE, set moe_backend='triton' or moe_backend='auto' "
+                "(auto selects Triton automatically when LoRA is enabled). "
+                "For quantized MoE, mix LoRAExpertsMixin into the experts class "
+                "and consume self._lora_context in apply()."
+            )
         self._moe_kernel = moe_kernel
         self.base_layer._replace_quant_method(
             FusedMoEModularMethod(self.base_layer.quant_method, moe_kernel)
@@ -81,6 +117,114 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # the same event objects; reuse-within-a-pair is fine because the
         # second pair starts only after intermediate_cache1.add_() has joined.
         self._events = tuple(torch.cuda.Event() for _ in range(4))
+
+    def _init_lora_rank_metadata(self, max_loras: int) -> None:
+        # These are math ranks for each adapter. FlashInfer uses lora_max_rank
+        # as the padded storage stride for vLLM's stacked layouts.
+        self.w13_lora_ranks = torch.zeros(
+            (self._w13_slices, max_loras), dtype=torch.int32, device="cpu"
+        )
+        self.w2_lora_ranks = torch.zeros((max_loras,), dtype=torch.int32, device="cpu")
+        self.w13_lora_ranks_device = torch.zeros(
+            (self._w13_slices, max_loras), dtype=torch.int32, device=self.device
+        )
+        self.w2_lora_ranks_device = torch.zeros(
+            (max_loras,), dtype=torch.int32, device=self.device
+        )
+        self.w13_lora_weight_ptrs_device = self._build_flashinfer_lora_weight_ptrs(
+            self.w13_lora_a_stacked, self.w13_lora_b_stacked, max_loras
+        )
+        self.w2_lora_weight_ptrs_device = self._build_flashinfer_lora_weight_ptrs(
+            self.w2_lora_a_stacked, self.w2_lora_b_stacked, max_loras
+        )
+
+    @staticmethod
+    def _build_flashinfer_lora_weight_ptrs(
+        lora_a_stacked: tuple[torch.Tensor, ...],
+        lora_b_stacked: tuple[torch.Tensor, ...],
+        max_loras: int,
+    ) -> tuple[torch.Tensor, ...]:
+        weight_ptrs = []
+        for lora_a, lora_b in zip(lora_a_stacked, lora_b_stacked):
+            host_ptrs = torch.empty((max_loras * 2,), dtype=torch.int64, device="cpu")
+            for lora_idx in range(max_loras):
+                host_ptrs[lora_idx * 2] = int(lora_a[lora_idx].data_ptr())
+                host_ptrs[lora_idx * 2 + 1] = int(lora_b[lora_idx].data_ptr())
+            weight_ptrs.append(host_ptrs.to(device=lora_a.device, non_blocking=True))
+        return tuple(weight_ptrs)
+
+    @staticmethod
+    def _set_lora_rank(
+        host_ranks: torch.Tensor,
+        device_ranks: torch.Tensor,
+        index: int,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+        storage_rank: int,
+    ) -> None:
+        rank = min(lora_a.shape[1], lora_b.shape[-1], storage_rank)
+        host_ranks[index] = rank
+        device_ranks[index] = rank
+
+    def _build_flashinfer_lora_params(
+        self, hidden_states: torch.Tensor
+    ) -> FusedMoELoraParams | None:
+        expected_lora_dtype = self.base_layer.moe_config.in_dtype
+        lora_stacks = (
+            self.w13_lora_a_stacked,
+            self.w13_lora_b_stacked,
+            self.w2_lora_a_stacked,
+            self.w2_lora_b_stacked,
+        )
+        if any(t.dtype != expected_lora_dtype for stack in lora_stacks for t in stack):
+            raise NotImplementedError(
+                "FlashInfer CUTLASS MoE LoRA requires LoRA weights to match "
+                "the MoE input dtype."
+            )
+
+        num_tokens = hidden_states.size(0)
+        token_lora_indices = self.punica_wrapper.token_lora_indices[:num_tokens]
+        if token_lora_indices.numel() == 0:
+            return None
+
+        token_mapping_meta = getattr(self.punica_wrapper, "token_mapping_meta", None)
+        if (
+            token_mapping_meta is not None
+            and token_mapping_meta.no_lora_flag_cpu.item()
+        ):
+            return None
+
+        if self._w13_slices == 2:
+            # FlashInfer CUTLASS weights are converted to W31 order. vLLM
+            # stores LoRA slices as W13, so w1/gate is passed as fc1 and the
+            # w3/up slice is passed as the gated companion.
+            fc1_slice = 0
+            gated_slice = 1
+        else:
+            fc1_slice = 0
+            gated_slice = None
+
+        gated_lora_ranks = None
+        gated_lora_weight_ptrs = None
+        max_rank = max(
+            self.w13_lora_a_stacked[fc1_slice].shape[2],
+            self.w2_lora_a_stacked[0].shape[2],
+        )
+        if gated_slice is not None:
+            gated_lora_ranks = self.w13_lora_ranks_device[gated_slice]
+            gated_lora_weight_ptrs = self.w13_lora_weight_ptrs_device[gated_slice]
+            max_rank = max(max_rank, self.w13_lora_a_stacked[gated_slice].shape[2])
+
+        return FusedMoELoraParams(
+            token_lora_indices=token_lora_indices,
+            fc1_lora_ranks=self.w13_lora_ranks_device[fc1_slice],
+            fc1_lora_weight_ptrs=self.w13_lora_weight_ptrs_device[fc1_slice],
+            fc2_lora_ranks=self.w2_lora_ranks_device,
+            fc2_lora_weight_ptrs=self.w2_lora_weight_ptrs_device[0],
+            gated_lora_ranks=gated_lora_ranks,
+            gated_lora_weight_ptrs=gated_lora_weight_ptrs,
+            lora_max_rank=max_rank,
+        )
 
     def _build_lora_context(self):
         use_dual_stream = (
@@ -200,6 +344,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self._verify_ep_fs(lora_config)
         self.max_loras = lora_config.max_loras
         self.fully_sharded = lora_config.fully_sharded_loras
+        if self._uses_flashinfer_lora and self.fully_sharded:
+            raise NotImplementedError(
+                "FlashInfer CUTLASS MoE LoRA does not support fully sharded LoRA."
+            )
 
         self.adapter_enabled = torch.tensor(
             [0] * (max_loras + 1), dtype=torch.int, device=self.device
@@ -207,6 +355,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         self._create_lora_a_weights(max_loras, lora_config)
         self._create_lora_b_weights(max_loras, lora_config)
+        if self._uses_flashinfer_lora:
+            self._init_lora_rank_metadata(max_loras)
         # They will be used by 'LoRALayerWeights.create_dummy_lora_weights'
         # to create a dummy LoRA weights.
         # TODO Optimize this section
@@ -298,9 +448,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         for pos in range(self._w13_slices):
             self.w13_lora_a_stacked[pos][index] = 0
             self.w13_lora_b_stacked[pos][index] = 0
+            if self._uses_flashinfer_lora:
+                self.w13_lora_ranks[pos][index] = 0
+                self.w13_lora_ranks_device[pos][index] = 0
 
         self.w2_lora_a_stacked[0][index] = 0
         self.w2_lora_b_stacked[0][index] = 0
+        if self._uses_flashinfer_lora:
+            self.w2_lora_ranks[index] = 0
+            self.w2_lora_ranks_device[index] = 0
         self.adapter_enabled[index] = 0
 
     #
@@ -334,32 +490,58 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             == w3_lora_a.shape[0]
         )
 
-        slliced_w1_lora_a = self._slice_w13_a(w1_lora_a)
-        slliced_w1_lora_b = self._slice_w13_b(w1_lora_b)
+        sliced_w1_lora_a = self._slice_w13_a(w1_lora_a)
+        sliced_w1_lora_b = self._slice_w13_b(w1_lora_b)
 
         sliced_w2_lora_a = self._slice_w2_a(w2_lora_a)
         sliced_w2_lora_b = self._slice_w2_b(w2_lora_b)
+        if self._uses_flashinfer_lora:
+            self._set_lora_rank(
+                self.w13_lora_ranks[0],
+                self.w13_lora_ranks_device[0],
+                index,
+                sliced_w1_lora_a,
+                sliced_w1_lora_b,
+                self.w13_lora_a_stacked[0].shape[2],
+            )
+            self._set_lora_rank(
+                self.w2_lora_ranks,
+                self.w2_lora_ranks_device,
+                index,
+                sliced_w2_lora_a,
+                sliced_w2_lora_b,
+                self.w2_lora_a_stacked[0].shape[2],
+            )
 
         self.w13_lora_a_stacked[0][
-            index, :, : slliced_w1_lora_a.shape[1], : slliced_w1_lora_a.shape[2]
-        ].copy_(slliced_w1_lora_a, non_blocking=True)
+            index, :, : sliced_w1_lora_a.shape[1], : sliced_w1_lora_a.shape[2]
+        ].copy_(sliced_w1_lora_a, non_blocking=True)
 
         self.w13_lora_b_stacked[0][
-            index, :, : slliced_w1_lora_b.shape[1], : slliced_w1_lora_b.shape[2]
-        ].copy_(slliced_w1_lora_b, non_blocking=True)
+            index, :, : sliced_w1_lora_b.shape[1], : sliced_w1_lora_b.shape[2]
+        ].copy_(sliced_w1_lora_b, non_blocking=True)
 
         # Only copy w3 (up_proj) for gated MoE (_w13_slices == 2)
         if self._w13_slices == 2:
-            slliced_w3_lora_a = self._slice_w13_a(w3_lora_a)
-            slliced_w3_lora_b = self._slice_w13_b(w3_lora_b)
+            sliced_w3_lora_a = self._slice_w13_a(w3_lora_a)
+            sliced_w3_lora_b = self._slice_w13_b(w3_lora_b)
+            if self._uses_flashinfer_lora:
+                self._set_lora_rank(
+                    self.w13_lora_ranks[1],
+                    self.w13_lora_ranks_device[1],
+                    index,
+                    sliced_w3_lora_a,
+                    sliced_w3_lora_b,
+                    self.w13_lora_a_stacked[1].shape[2],
+                )
 
             self.w13_lora_a_stacked[1][
-                index, :, : slliced_w3_lora_a.shape[1], : slliced_w3_lora_a.shape[2]
-            ].copy_(slliced_w3_lora_a, non_blocking=True)
+                index, :, : sliced_w3_lora_a.shape[1], : sliced_w3_lora_a.shape[2]
+            ].copy_(sliced_w3_lora_a, non_blocking=True)
 
             self.w13_lora_b_stacked[1][
-                index, :, : slliced_w3_lora_b.shape[1], : slliced_w3_lora_b.shape[2]
-            ].copy_(slliced_w3_lora_b, non_blocking=True)
+                index, :, : sliced_w3_lora_b.shape[1], : sliced_w3_lora_b.shape[2]
+            ].copy_(sliced_w3_lora_b, non_blocking=True)
 
         self.w2_lora_a_stacked[0][
             index, :, : sliced_w2_lora_a.shape[1], : sliced_w2_lora_a.shape[2]
@@ -371,6 +553,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
     def set_mapping(self, punica_wrapper):
         super().set_mapping(punica_wrapper)
+        if self._uses_flashinfer_lora:
+            return
         lora_context = self._build_lora_context()
         self._moe_kernel.fused_experts.set_lora_context(lora_context)
         prepare_finalize = self._moe_kernel.prepare_finalize

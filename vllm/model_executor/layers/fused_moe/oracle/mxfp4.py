@@ -417,12 +417,76 @@ def select_mxfp4_moe_backend(
     Note: Shape-specific fallbacks may still occur at runtime.
     """
     requested_activation_key = _resolve_activation_key(activation_key)
+    device_capability = (
+        current_platform.get_device_capability() if current_platform.is_cuda() else None
+    )
+    triton_kernels_supported = has_triton_kernels() and (
+        device_capability is not None and (9, 0) <= device_capability < (11, 0)
+    )
 
     activation_format = (
         mk.FusedMoEActivationFormat.BatchedExperts
         if config.moe_parallel_config.use_batched_activation_format
         else mk.FusedMoEActivationFormat.Standard
     )
+
+    # LoRA: default to the existing separate experts backend path, but allow
+    # explicit FlashInfer CUTLASS selection now that it can consume LoRA
+    # rank/pointer metadata directly.
+    if config.is_lora_enabled:
+        if not current_platform.is_cuda():
+            # ROCm: Triton mxfp4 LoRA hits GPU memory faults due to
+            # triton_kernels.tensor.Tensor / HIP read-only page issues
+            # during weight swizzle and LoRA forward. Needs work from
+            # the triton_kernels/aiter side.
+            raise NotImplementedError("Mxfp4 LoRA is currently only supported on CUDA.")
+        if config.moe_backend in ("flashinfer_cutlass", "flashinfer_cutlass_afp8"):
+            requested_backends = map_mxfp4_backend(config.moe_backend)
+            candidates = _filter_by_activation(
+                requested_backends, requested_activation_key
+            )
+            if not candidates:
+                raise ValueError(
+                    f"moe_backend={config.moe_backend!r} does not support "
+                    f"activation={requested_activation_key}; supported variants: "
+                    f"{[b.name for b in requested_backends]}"
+                )
+            last_error: Exception | None = None
+            for requested_backend in candidates:
+                act_key = (
+                    requested_activation_key
+                    if requested_activation_key is not None
+                    else _backend_activation_key(requested_backend)
+                )
+                try:
+                    return _return_or_raise(
+                        requested_backend,
+                        config,
+                        kMxfp4Static,
+                        act_key,
+                        activation_format,
+                    )
+                except ValueError as e:
+                    last_error = e
+            assert last_error is not None
+            raise last_error
+        if envs.VLLM_MXFP4_USE_MARLIN is False and triton_kernels_supported:
+            logger.info_once("Using Triton backend for mxfp4 lora")
+            return _return_or_raise(
+                Mxfp4MoeBackend.TRITON_UNFUSED,
+                config,
+                kMxfp4Static,
+                None,
+                activation_format,
+            )
+        logger.info_once("Using Marlin backend for mxfp4 lora")
+        return _return_or_raise(
+            Mxfp4MoeBackend.MARLIN,
+            config,
+            kMxfp4Static,
+            None,
+            activation_format,
+        )
 
     runner_backend = config.moe_backend
     if runner_backend != "auto":

@@ -278,6 +278,26 @@ def select_fp8_moe_backend(
                 return backend, k_cls
         raise ValueError(_make_log_unsupported(backend, reason))
 
+    if config.is_lora_enabled:
+        if config.moe_backend == "flashinfer_cutlass":
+            return _return_or_raise(
+                Fp8MoeBackend.FLASHINFER_CUTLASS,
+                config,
+                weight_key,
+                activation_key,
+                activation_format,
+            )
+        backend = Fp8MoeBackend.TRITON
+        if activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
+            backend = Fp8MoeBackend.BATCHED_TRITON
+        return _return_or_raise(
+            backend,
+            config,
+            weight_key,
+            activation_key,
+            activation_format,
+        )
+
     # Handle explicit moe_backend from user.
     runner_backend = config.moe_backend
     if runner_backend != "auto":

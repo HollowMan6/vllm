@@ -43,6 +43,19 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+
+@dataclass(frozen=True)
+class FusedMoELoraParams:
+    token_lora_indices: torch.Tensor
+    fc1_lora_ranks: torch.Tensor
+    fc1_lora_weight_ptrs: torch.Tensor
+    fc2_lora_ranks: torch.Tensor
+    fc2_lora_weight_ptrs: torch.Tensor
+    gated_lora_ranks: torch.Tensor | None = None
+    gated_lora_weight_ptrs: torch.Tensor | None = None
+    lora_max_rank: int = 0
+
+
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
 # The goal is to be able to utilize different communication mechanisms with
@@ -577,7 +590,9 @@ class FusedMoEExperts(ABC):
             return False, _make_reason(f"{activation_format.value} activation format")
         elif envs.VLLM_BATCH_INVARIANT and not cls._supports_batch_invariance():
             return False, _make_reason("batch invariance")
-        elif moe_config.is_lora_enabled and not cls.supports_lora():
+        elif moe_config.is_lora_enabled and not (
+            cls.supports_lora() or cls.supports_fused_moe_lora_params()
+        ):
             return False, _make_reason("LoRA")
         return True, None
 
@@ -749,6 +764,14 @@ class FusedMoEExperts(ABC):
 
         LoRA-aware experts should mix in LoRAExpertsMixin, which flips this
         to True and provides the per-forward LoRA state plumbing.
+        """
+        return False
+
+    @staticmethod
+    def supports_fused_moe_lora_params() -> bool:
+        """
+        A flag indicating whether or not this class can consume structured
+        per-token LoRA rank/pointer metadata.
         """
         return False
 
@@ -1217,6 +1240,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
         output_alias: torch.Tensor | None = None,
+        fused_moe_lora_params: FusedMoELoraParams | None = None,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1262,23 +1286,32 @@ class FusedMoEKernelModularImpl:
             ):
                 fused_out = output_alias
 
-        self.fused_experts.apply(
-            output=fused_out,
-            hidden_states=a1q,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            a1q_scale=a1q_scale,
-            a2_scale=self.fused_experts.a2_scale,
-            workspace13=workspace13,
-            workspace2=workspace2,
-            expert_tokens_meta=expert_tokens_meta,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-        )
+        apply_kwargs = {
+            "output": fused_out,
+            "hidden_states": a1q,
+            "w1": w1,
+            "w2": w2,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "activation": activation,
+            "global_num_experts": global_num_experts,
+            "expert_map": expert_map,
+            "a1q_scale": a1q_scale,
+            "a2_scale": self.fused_experts.a2_scale,
+            "workspace13": workspace13,
+            "workspace2": workspace2,
+            "expert_tokens_meta": expert_tokens_meta,
+            "apply_router_weight_on_input": apply_router_weight_on_input,
+        }
+        if fused_moe_lora_params is not None:
+            if not self.fused_experts.supports_fused_moe_lora_params():
+                raise NotImplementedError(
+                    f"{self.fused_experts.__class__.__name__} does not support "
+                    "fused_moe_lora_params."
+                )
+            apply_kwargs["fused_moe_lora_params"] = fused_moe_lora_params
+
+        self.fused_experts.apply(**apply_kwargs)
 
         return fused_out
 
@@ -1363,6 +1396,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool = False,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        fused_moe_lora_params: FusedMoELoraParams | None = None,
     ) -> torch.Tensor:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1388,6 +1422,9 @@ class FusedMoEKernelModularImpl:
         - shared_experts_input (Optional[torch.Tensor]): Optional separate
           input for shared experts. For latent MoE, this is the original
           hidden_states before latent projection.
+        - fused_moe_lora_params (Optional[FusedMoELoraParams]): Optional
+          per-token LoRA rank/pointer metadata for kernels that can apply LoRA
+          inside the fused MoE path.
 
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
@@ -1427,6 +1464,7 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
             output_alias=output,
+            fused_moe_lora_params=fused_moe_lora_params,
         )
 
         return self._finalize(
@@ -1572,7 +1610,10 @@ class FusedMoEKernel:
         return self.fused_experts.moe_config
 
     def supports_lora(self) -> bool:
-        return self.fused_experts.supports_lora()
+        return (
+            self.fused_experts.supports_lora()
+            or self.fused_experts.supports_fused_moe_lora_params()
+        )
 
     def _post_init_setup(self):
         """
@@ -1643,6 +1684,7 @@ class FusedMoEKernel:
         apply_router_weight_on_input: bool,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        fused_moe_lora_params: FusedMoELoraParams | None = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
         return self.impl.apply(
@@ -1657,4 +1699,5 @@ class FusedMoEKernel:
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            fused_moe_lora_params=fused_moe_lora_params,
         )
