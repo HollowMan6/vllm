@@ -326,9 +326,14 @@ class LoRAModelManager:
     def _deactivate_adapter(self, lora_id: int):
         try:
             index = self.lora_index_to_id.index(lora_id)
-            self.lora_index_to_id[index] = None
         except ValueError:
-            pass
+            return
+        self._reset_lora_slot(index)
+        self.lora_index_to_id[index] = None
+
+    def _reset_lora_slot(self, index: int) -> None:
+        for module in self.modules.values():
+            module.reset_lora(index)
 
     def _add_adapter(self, lora: LoRAModel):
         self._create_merged_loras_inplace(lora)
@@ -368,6 +373,9 @@ class LoRAModelManager:
 
     def remove_all_adapters(self):
         """Remove all LoRAModels from the manager."""
+        for index, lora_id in enumerate(self.lora_index_to_id):
+            if lora_id is not None:
+                self._reset_lora_slot(index)
         self._registered_adapters.clear()
         self.lora_index_to_id = [None] * self.lora_slots
         self._active_adapters.clear()

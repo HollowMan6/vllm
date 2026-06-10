@@ -162,11 +162,6 @@ def select_unquantized_moe_backend(
     if current_platform.is_out_of_tree():
         return UnquantizedMoeBackend.OOT, None
 
-    if moe_config.is_lora_enabled:
-        return UnquantizedMoeBackend.TRITON, backend_to_kernel_cls(
-            UnquantizedMoeBackend.TRITON
-        )
-
     # NOTE: the kernels are selected in the following order.
     AVAILABLE_BACKENDS = _get_priority_backends(moe_config)
 
@@ -214,6 +209,25 @@ def select_unquantized_moe_backend(
         raise ValueError(_make_log_unsupported(backend, reason))
 
     runner_backend = moe_config.moe_backend
+    if moe_config.is_lora_enabled:
+        if runner_backend == "flashinfer_cutlass":
+            return _return_or_raise(
+                UnquantizedMoeBackend.FLASHINFER_CUTLASS,
+                moe_config,
+                activation_format,
+            )
+
+        backend = (
+            UnquantizedMoeBackend.BATCHED_TRITON
+            if activation_format == mk.FusedMoEActivationFormat.BatchedExperts
+            else UnquantizedMoeBackend.TRITON
+        )
+        return _return_or_raise(
+            backend,
+            moe_config,
+            activation_format,
+        )
+
     if runner_backend != "auto":
         requested_backend = map_unquantized_backend(runner_backend)
         if (
@@ -244,7 +258,6 @@ def select_unquantized_moe_backend(
                     f"FlashInfer MOE backend {fi_backend} "
                     "does not support unquantized MoE."
                 )
-            k_cls = backend_to_kernel_cls(backend)
             return _return_or_raise(backend, moe_config, activation_format)
         else:
             # If the user is not explicit about the backend, try both.

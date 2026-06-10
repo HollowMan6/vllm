@@ -211,19 +211,39 @@ def test_select_lora_backend_prefers_triton():
 
 
 @skipif_not_cuda_rocm
-def test_select_lora_explicit_non_triton_backend():
-    """LoRA should override explicit non-Triton backend to Triton."""
-    moe_config = make_dummy_moe_config()
-    moe_config.is_lora_enabled = True
+@patch(
+    "vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe."
+    "has_flashinfer_cutlass_fused_moe",
+    return_value=True,
+)
+def test_select_lora_explicit_flashinfer_cutlass_backend(
+    _mock_has_flashinfer_cutlass_fused_moe,
+):
+    """Explicit FlashInfer CUTLASS can select the multi-LoRA CUTLASS path."""
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "is_rocm", return_value=False),
+        patch.object(current_platform, "has_device_capability", return_value=True),
+        patch.object(
+            current_platform,
+            "is_device_capability",
+            side_effect=lambda capability: capability == 90,
+        ),
+        patch.object(
+            current_platform,
+            "is_device_capability_family",
+            return_value=False,
+        ),
+    ):
+        moe_config = make_dummy_moe_config()
+        moe_config.is_lora_enabled = True
+        moe_config.moe_backend = "flashinfer_cutlass"
 
-    # Use string from mapping in function map_unquantized_backend()
-    moe_config.moe_backend = "flashinfer_cutlass"
+        selected_backend, experts_cls = select_unquantized_moe_backend(
+            moe_config=moe_config
+        )
 
-    selected_backend, experts_cls = select_unquantized_moe_backend(
-        moe_config=moe_config
-    )
-
-    assert selected_backend == UnquantizedMoeBackend.TRITON
+    assert selected_backend == UnquantizedMoeBackend.FLASHINFER_CUTLASS
     assert experts_cls is not None
 
 

@@ -11,6 +11,12 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe.experts.lora_context import (
+    MoELoRAContext,
+)
+from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
+    LoRAExpertsMixin,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
@@ -60,7 +66,7 @@ def is_valid_flashinfer_cutlass_fused_moe(
     return True
 
 
-class FlashInferExperts(mk.FusedMoEExpertsModular):
+class FlashInferExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.quant_config.use_nvfp4_w4a4:
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
@@ -90,6 +96,10 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         self.tp_size = moe_config.moe_parallel_config.tp_size
         self.out_dtype = moe_config.in_dtype
         self.use_dp = moe_config.moe_parallel_config.dp_size > 1
+        self._flashinfer_lora_ptr_cache: dict[tuple[int, ...], torch.Tensor] = {}
+        self._flashinfer_lora_rank_cache: dict[
+            tuple[str, int, int, int], torch.Tensor
+        ] = {}
         # Enables DeepSeek-style FP8 block-scale path:
         # - pass per-block weight scales to the kernel
         # - skip input activation quantization (kernel applies scaling)
@@ -126,6 +136,146 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
                     device=self.device,
                     dtype=torch.float32,
                 )
+
+    @staticmethod
+    def _device_cache_key(device: torch.device) -> tuple[str, int]:
+        index = device.index
+        if index is None and device.type == "cuda":
+            index = torch.cuda.current_device()
+        return device.type, -1 if index is None else index
+
+    def _flashinfer_lora_ranks(
+        self,
+        *,
+        max_loras: int,
+        rank: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        device_type, device_index = self._device_cache_key(device)
+        key = (device_type, device_index, max_loras, rank)
+        cached = self._flashinfer_lora_rank_cache.get(key)
+        if cached is None:
+            cached = torch.full((max_loras,), rank, dtype=torch.int32, device=device)
+            self._flashinfer_lora_rank_cache[key] = cached
+        return cached
+
+    def _flashinfer_lora_ptrs(
+        self,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+    ) -> torch.Tensor:
+        if not lora_a.is_contiguous() or not lora_b.is_contiguous():
+            raise NotImplementedError(
+                "FlashInfer CUTLASS MoE LoRA requires contiguous adapter storage."
+            )
+
+        max_loras = lora_a.shape[0]
+        key = (
+            lora_a.data_ptr(),
+            lora_b.data_ptr(),
+            max_loras,
+            lora_a.stride(0),
+            lora_b.stride(0),
+            lora_a.element_size(),
+            lora_b.element_size(),
+        )
+        cached = self._flashinfer_lora_ptr_cache.get(key)
+        if cached is None:
+            a_step = lora_a.stride(0) * lora_a.element_size()
+            b_step = lora_b.stride(0) * lora_b.element_size()
+            ptrs: list[int] = []
+            for lora_id in range(max_loras):
+                ptrs.extend(
+                    [
+                        lora_a.data_ptr() + lora_id * a_step,
+                        lora_b.data_ptr() + lora_id * b_step,
+                    ]
+                )
+            cached = torch.tensor(ptrs, dtype=torch.int64, device=lora_a.device)
+            self._flashinfer_lora_ptr_cache[key] = cached
+        return cached
+
+    @staticmethod
+    def _flashinfer_token_lora_indices(
+        lora_context: MoELoRAContext,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        if lora_context.local_token_lora_mapping is not None:
+            token_lora_indices = lora_context.local_token_lora_mapping
+        else:
+            token_lora_indices = lora_context.punica_wrapper.token_lora_indices
+            token_mapping_meta = getattr(
+                lora_context.punica_wrapper, "token_mapping_meta", None
+            )
+            if (
+                token_mapping_meta is not None
+                and token_mapping_meta.token_lora_mapping.shape[0] >= num_tokens
+                and not token_mapping_meta.no_lora_flag_cpu.item()
+            ):
+                token_lora_indices = token_mapping_meta.token_lora_mapping
+        if token_lora_indices.shape[0] < num_tokens:
+            raise RuntimeError(
+                "FlashInfer CUTLASS MoE LoRA received fewer token adapter "
+                "indices than input tokens."
+            )
+        token_lora_indices = token_lora_indices[:num_tokens]
+        if token_lora_indices.dtype not in (torch.int32, torch.int64):
+            token_lora_indices = token_lora_indices.to(torch.int32)
+        return token_lora_indices
+
+    def _flashinfer_lora_kwargs(
+        self,
+        lora_context: MoELoRAContext | None,
+        *,
+        num_tokens: int,
+        activation: MoEActivation,
+    ) -> dict[str, torch.Tensor | int]:
+        if lora_context is None:
+            return {}
+        if lora_context.fully_sharded:
+            raise NotImplementedError(
+                "FlashInfer CUTLASS MoE LoRA does not support fully sharded LoRA yet."
+            )
+        if self.ep_size != 1 or self.ep_rank != 0:
+            raise NotImplementedError(
+                "FlashInfer CUTLASS MoE LoRA does not support expert parallelism yet."
+            )
+
+        is_gated = activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
+        if is_gated and lora_context.w13_num_slices != 2:
+            raise RuntimeError("Gated FlashInfer MoE LoRA requires two w13 slices.")
+        if not is_gated and lora_context.w13_num_slices != 1:
+            raise RuntimeError("Non-gated FlashInfer MoE LoRA requires one w13 slice.")
+
+        lora_max_rank = lora_context.w13_lora_a_stacked[0].shape[-2]
+        ranks = self._flashinfer_lora_ranks(
+            max_loras=lora_context.max_loras,
+            rank=lora_max_rank,
+            device=lora_context.w13_lora_a_stacked[0].device,
+        )
+        kwargs: dict[str, torch.Tensor | int] = {
+            "token_lora_indices": self._flashinfer_token_lora_indices(
+                lora_context, num_tokens
+            ),
+            "fc1_lora_ranks": ranks,
+            "fc1_lora_weight_ptrs": self._flashinfer_lora_ptrs(
+                lora_context.w13_lora_a_stacked[0],
+                lora_context.w13_lora_b_stacked[0],
+            ),
+            "fc2_lora_ranks": ranks,
+            "fc2_lora_weight_ptrs": self._flashinfer_lora_ptrs(
+                lora_context.w2_lora_a_stacked[0],
+                lora_context.w2_lora_b_stacked[0],
+            ),
+            "lora_max_rank": lora_max_rank,
+        }
+        if is_gated:
+            kwargs["gated_lora_ranks"] = ranks
+            kwargs["gated_lora_weight_ptrs"] = self._flashinfer_lora_ptrs(
+                lora_context.w13_lora_a_stacked[1],
+                lora_context.w13_lora_b_stacked[1],
+            )
+        return kwargs
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -378,9 +528,18 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             fc1_expert_weights = w1
             fc2_expert_weights = w2
 
+        token_selected_experts = (
+            topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+        )
+        lora_kwargs = self._flashinfer_lora_kwargs(
+            self._lora_context,
+            num_tokens=hidden_states.shape[0],
+            activation=activation,
+        )
+
         _ = flashinfer_cutlass_fused_moe(
             input=hidden_states,
-            token_selected_experts=topk_ids.to(torch.int),
+            token_selected_experts=token_selected_experts,
             token_final_scales=topk_weights,
             fc1_expert_weights=fc1_expert_weights,
             fc2_expert_weights=fc2_expert_weights,
@@ -403,9 +562,10 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             use_w4_group_scaling=use_w4_group_scaling,
             tune_max_num_tokens=max(self.max_capture_size, 1),
+            **lora_kwargs,
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        # No support for LoRA in flashinfer_cutlass_fused_moe.
-        # See TODOs in flashinfer functions runMoe and runMoeMinLatency.
-        raise NotImplementedError("LoRA is not supported for flashinfer_cutlass_moe")
+        raise NotImplementedError(
+            "FlashInfer CUTLASS MoE writes the reduced output directly."
+        )
