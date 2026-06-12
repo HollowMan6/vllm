@@ -253,14 +253,26 @@ class FlashInferExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             rank=lora_max_rank,
             device=lora_context.w13_lora_a_stacked[0].device,
         )
+        fc1_lora_a = lora_context.w13_lora_a_stacked[0]
+        fc1_lora_b = lora_context.w13_lora_b_stacked[0]
+        gated_lora_a = None
+        gated_lora_b = None
+        if is_gated:
+            # vLLM stores gated MoE LoRA as [gate_proj, up_proj], while the
+            # FlashInfer API names them [gated_lora, fc1_lora].
+            gated_lora_a = lora_context.w13_lora_a_stacked[0]
+            gated_lora_b = lora_context.w13_lora_b_stacked[0]
+            fc1_lora_a = lora_context.w13_lora_a_stacked[1]
+            fc1_lora_b = lora_context.w13_lora_b_stacked[1]
+
         kwargs: dict[str, torch.Tensor | int] = {
             "token_lora_indices": self._flashinfer_token_lora_indices(
                 lora_context, num_tokens
             ),
             "fc1_lora_ranks": ranks,
             "fc1_lora_weight_ptrs": self._flashinfer_lora_ptrs(
-                lora_context.w13_lora_a_stacked[0],
-                lora_context.w13_lora_b_stacked[0],
+                fc1_lora_a,
+                fc1_lora_b,
             ),
             "fc2_lora_ranks": ranks,
             "fc2_lora_weight_ptrs": self._flashinfer_lora_ptrs(
@@ -270,10 +282,11 @@ class FlashInferExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             "lora_max_rank": lora_max_rank,
         }
         if is_gated:
+            assert gated_lora_a is not None and gated_lora_b is not None
             kwargs["gated_lora_ranks"] = ranks
             kwargs["gated_lora_weight_ptrs"] = self._flashinfer_lora_ptrs(
-                lora_context.w13_lora_a_stacked[1],
-                lora_context.w13_lora_b_stacked[1],
+                gated_lora_a,
+                gated_lora_b,
             )
         return kwargs
 
