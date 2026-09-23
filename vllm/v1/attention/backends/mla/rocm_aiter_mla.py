@@ -2291,13 +2291,16 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             [torch.Tensor, torch.Tensor, bool], tuple[torch.Tensor, torch.Tensor]
         ]
         | None = None,
+        kv_b_proj_lora: object | None = None,
+        request_lora_mapping: torch.Tensor | None = None,
     ):
         attn_metadata = cast(AiterMLAMetadata, attn_metadata)
         assert attn_metadata.prefill is not None
         prefill = attn_metadata.prefill
         weight = getattr(self.kv_b_proj, "weight", None)
         eligible = (
-            _supports_fused_dcp_prefill_config(
+            request_lora_mapping is None
+            and _supports_fused_dcp_prefill_config(
                 self.kv_cache_dtype,
                 prefill.q_data_type,
                 self.kv_lora_rank,
@@ -2323,6 +2326,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 k_scale,
                 dcp_world_size,
                 fused_mla_kv_concat_fn,
+                kv_b_proj_lora=kv_b_proj_lora,
+                request_lora_mapping=request_lora_mapping,
             )
         from vllm.platforms import current_platform
 
@@ -2539,6 +2544,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         k_scale: torch.Tensor,
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
+        kv_b_proj_lora: object | None = None,
+        token_lora_mapping: torch.Tensor | None = None,
     ) -> None:
         """Dispatch prefill to the FP8 ASM kernel when available.
 
@@ -2565,6 +2572,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 k_scale,
                 output,
                 output_scale,
+                kv_b_proj_lora,
+                token_lora_mapping,
             )
 
         assert attn_metadata.prefill is not None
@@ -2581,6 +2590,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 k_scale,
                 output,
                 output_scale,
+                kv_b_proj_lora,
+                token_lora_mapping,
             )
 
         assert output_scale is None, (
@@ -2590,6 +2601,9 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
+        apply_lora = getattr(kv_b_proj_lora, "apply_mla_kv_b_lora_linear", None)
+        if apply_lora is not None and token_lora_mapping is not None:
+            apply_lora(kv_c_normed, kv_nope, token_lora_mapping)
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
