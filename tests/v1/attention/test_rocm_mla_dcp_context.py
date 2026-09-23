@@ -142,7 +142,7 @@ def test_dcp_prefill_unsupported_formats_use_original_path(monkeypatch, unsuppor
     def fused_mla_kv_concat(kv_nope, k_pe, use_fp8_prefill):
         raise AssertionError("The fallback should receive the callback")
 
-    def original_path(*args):
+    def original_path(*args, **kwargs):
         assert args[-1] is fused_mla_kv_concat
         return expected
 
