@@ -35,11 +35,17 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.modelopt import (
     LINEAR_ALGOS,
+    WEIGHT,
+    KNvfp4Static,
     ModelOptFp8Config,
     ModelOptLinearMethod,
     ModelOptMixedPrecisionConfig,
     ModelOptMxFp8Config,
     ModelOptNvFp4Config,
+)
+from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    apply_fused_global_scale_ratio,
+    fused_global_scale_ratio,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
@@ -1679,3 +1685,78 @@ def test_modelopt_block_quant_loads_expert_blocks_with_aligned_tp_slices(
             "w2",
             0,
         )
+
+
+# Fused NVFP4 linear layers (q/k/v, gate/up) whose shards store different global
+# weight scales: the GEMM runs with the largest, and each shard's output columns
+# get its own back.
+
+
+def test_ratio_modelopt_multipliers():
+    kept, ratio = fused_global_scale_ratio(
+        torch.tensor([0.25, 1.0, 1.0]), [2, 1, 1], divisor=False
+    )
+    assert kept.item() == 1.0
+    torch.testing.assert_close(ratio, torch.tensor([0.25, 0.25, 1.0, 1.0]))
+
+
+def test_ratio_compressed_tensors_divisors():
+    # divisors 4 and 1 are the scales 1/4 and 1: the GEMM runs with 1
+    kept, ratio = fused_global_scale_ratio(
+        torch.tensor([4.0, 1.0]), [1, 2], divisor=True
+    )
+    assert kept.item() == 1.0
+    torch.testing.assert_close(ratio, torch.tensor([0.25, 1.0, 1.0]))
+
+
+def test_shared_scale_needs_no_ratio():
+    kept, ratio = fused_global_scale_ratio(
+        torch.tensor([2.0, 2.0]), [4, 4], divisor=False
+    )
+    assert kept.item() == 2.0
+    assert ratio is None
+    out = torch.randn(3, 8)
+    assert apply_fused_global_scale_ratio(out, None) is out
+
+
+def test_rescaled_output_equals_per_shard_dequantization():
+    """Running with the kept scale and rescaling equals dequantizing each
+    shard with its own scale."""
+    torch.manual_seed(0)
+    x = torch.randn(3, 8)
+    w = torch.randn(5, 8)
+    scales = torch.tensor([0.125, 0.5])
+    own = torch.cat([scales[0].expand(2), scales[1].expand(3)]).unsqueeze(1)
+    kept, ratio = fused_global_scale_ratio(scales, [2, 3], divisor=False)
+    out = apply_fused_global_scale_ratio(x @ (w * kept).T, ratio)
+    torch.testing.assert_close(out, x @ (w * own).T)
+
+
+def _nvfp4_layer(weight_scale_2, widths):
+    layer = torch.nn.Module()
+    layer.logical_widths = widths
+    out = sum(widths)
+    layer.weight_scale = torch.nn.Parameter(
+        torch.ones(out, 1, dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale_2 = torch.nn.Parameter(
+        torch.tensor(weight_scale_2, dtype=torch.float32), requires_grad=False
+    )
+    return layer
+
+
+def test_knvfp4_static_keeps_largest_and_ratio():
+    layer = _nvfp4_layer([0.25, 1.0], [16, 16])
+    KNvfp4Static().process(layer, WEIGHT)
+    assert layer.weight_global_scale.item() == 1.0
+    torch.testing.assert_close(
+        layer.fused_global_scale_ratio,
+        torch.cat([torch.full((16,), 0.25), torch.ones(16)]),
+    )
+
+
+def test_knvfp4_static_shared_scale_has_no_ratio():
+    layer = _nvfp4_layer([0.5, 0.5, 0.5], [8, 4, 4])
+    KNvfp4Static().process(layer, WEIGHT)
+    assert layer.weight_global_scale.item() == 0.5
+    assert layer.fused_global_scale_ratio is None
